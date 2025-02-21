@@ -20,6 +20,7 @@ from plotly.subplots import make_subplots
 import webbrowser
 
 MODEL_NAME = "model.onnx"
+FAISS_INDEX_FILE = "faiss_index.idx"
 
 class ContrastiveLoss(nn.Module):
     """ 
@@ -89,6 +90,45 @@ def collate_fn(batch):
     input_b = nn.utils.rnn.pad_sequence(input_b, batch_first=True)
 
     return input_a, input_b, labels
+
+def get_embedding(model, input_sequence):
+    """
+    Generates an embedding for a single input sequence.
+    """
+    with torch.no_grad():  # No gradients needed for inference
+        try:
+            input_sequence = input_sequence.unsqueeze(0) # Add batch dimension
+            embedding = model.forward_once(input_sequence)
+            return embedding.squeeze(0) # Remove batch dimension
+        except Exception as e: # Handle any potential errors
+            print(f"Error getting embedding: {e}")
+            return None
+            
+def build_vector_db(model, embedding_dim, np_data, np_y):
+    index = faiss.IndexFlatL2(
+        embedding_dim
+    )  
+    print("Building vector db. Make take a few minutes...")
+    for j in range(np_data.shape[0]):
+        t1 = torch.from_numpy(np_data[j].astype(np.float32))
+        query_sequence = t1.reshape(-1, 1)
+        embedding = get_embedding(model, query_sequence)
+
+        if embedding is not None:
+            # print("Embedding:", embedding)
+            # Convert the embedding to a NumPy array for FAISS
+            embedding_np = embedding.numpy().reshape(
+                1, -1
+            )  
+
+            index.add(embedding_np) 
+        else:
+            print("Could not generate embedding.")
+
+    faiss.write_index(index, FAISS_INDEX_FILE)
+    print("FAISS index saved to 'faiss_index.idx'.")
+
+
 
 def main(args):
     f = args.file_path
@@ -218,8 +258,9 @@ def main(args):
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        if epoch == 0:
-            webbrowser.open("file://" + os.path.abspath(html_file))
+        if args.output_progress:
+            if epoch == 0:
+                webbrowser.open("file://" + os.path.abspath(html_file))
     
         losses.append(epoch_loss / len(train_loader))
 
@@ -239,41 +280,31 @@ def main(args):
         val_auc_scores.append(val_auc)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {losses[-1]:.4f}, Validation AUC: {val_auc:.4f}")
 
-        update_plot(epoch, loss, val_auc, html_file)
+        if args.output_progress:
+            update_plot(epoch, loss, val_auc, html_file)
 
     # Switch to eval mode
     model.eval()
-
-    def get_embedding(input_sequence):
-        """
-        Generates an embedding for a single input sequence.
-        """
-        with torch.no_grad():  # No gradients needed for inference
-            try:
-                input_sequence = input_sequence.unsqueeze(0) # Add batch dimension
-                embedding = model.forward_once(input_sequence)
-                return embedding.squeeze(0) # Remove batch dimension
-            except Exception as e: # Handle any potential errors
-                print(f"Error getting embedding: {e}")
-                return None
             
     # Test with a random signal
     input_dim = 1 # Example
     sequence_length = 15 # Example
     input_sequence = torch.randn(sequence_length, input_dim).float() 
 
-    embedding = get_embedding(input_sequence)
+    embedding = get_embedding(model, input_sequence)
     print(f"An embedding: {embedding}")
 
     # Save model
     save_model(model, np_data.shape[1], feature_names)
+
+    build_vector_db(model, embedding_dim, np_data, np_y)
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Train one-shot")
 
     parser.add_argument("-f", "--file_path", type=str, help="path to parquet data")
     parser.add_argument("-e", "--epoch", type=int, help="epoch count")
-    parser.add_argument("-x", "--add_texture", action='store_true', default=False, help='add texture')
+    parser.add_argument("-x", "--output_progress", action='store_true', default=False, help='')
 
     args = parser.parse_args()
 
