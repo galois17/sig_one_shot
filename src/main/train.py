@@ -7,10 +7,19 @@ from sklearn.metrics import roc_auc_score, roc_curve
 import faiss 
 import pandas as pd
 import random
+import torch.onnx
+import onnx
+from onnx import helper
 import argparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 import os
+import plotly.graph_objects as go
+from plotly.offline import plot  # For offline plotting
+from plotly.subplots import make_subplots
+import webbrowser
+
+MODEL_NAME = "model.onnx"
 
 class ContrastiveLoss(nn.Module):
     """ 
@@ -28,6 +37,7 @@ class ContrastiveLoss(nn.Module):
 class SiameseRNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, embedding_dim):
         super(SiameseRNN, self).__init__()
+        self.hidden_dim = hidden_dim
         # Keep it simple with Gru
         self.rnn = nn.GRU(input_dim, hidden_dim, batch_first=True)  
         self.fc = nn.Linear(hidden_dim, embedding_dim)  # Linear layer 
@@ -43,6 +53,31 @@ class SiameseRNN(nn.Module):
         embedding1 = self.forward_once(input1)
         embedding2 = self.forward_once(input2)
         return embedding1, embedding2
+
+def save_model(model, input_size, feature_names):
+    """ Save model """
+     
+    dummy_input = torch.randn(input_size, 1).float()
+    dummy_input = dummy_input.unsqueeze(0)
+    
+    
+    torch.onnx.export(model, (dummy_input, dummy_input), MODEL_NAME, 
+                      input_names=["input1", "input2"], output_names=["output1", "output2"])
+    
+    
+    # Load ONNX model to add metadata
+    onnx_model = onnx.load(MODEL_NAME)
+    metadata_props = {
+        "input_size": str(input_size),
+        "feature_order": ",".join(feature_names),
+    }
+
+    for key, value in metadata_props.items():
+        meta = onnx_model.metadata_props.add()
+        meta.key = key
+        meta.value = value
+
+    onnx.save(onnx_model, MODEL_NAME)
 
 def collate_fn(batch): 
     """ Handle variable sequence lengths """
@@ -75,10 +110,12 @@ def main(args):
     mappings = {'asco': 0, 'fucus': 1, 'h_asco': 2, 'h_fucus': 3,  'unknown': 4}
     inv_mappings = {v:k for k,v in mappings.items()}
 
-    np_data = df[ ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', \
+    feature_names = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6', 'b7', 'b8', \
                 'b9', 'b10', 'd1', 'd2', 'd3', 'd4', 'd5', 'd6', 'd7', \
                 'd8', 'd9', 'd10', 'ndvi', 'ndwi', 'elev', 
-                'energy', 'homogeneity', 'dissimilarity', 'ASM', 'entropy'] ].to_numpy()
+                'energy', 'homogeneity', 'dissimilarity', 'ASM', 'entropy']
+
+    np_data = df[feature_names].to_numpy()
     np_y = df['label'].to_numpy()
 
     input_dim = 1 
@@ -132,6 +169,44 @@ def main(args):
     # Training loop
     losses = []
     val_auc_scores = []
+
+    def update_plot(epoch, loss, auc, html_file):
+        losses.append(loss)
+        val_auc_scores.append(auc)
+        
+        fig = go.Figure()
+        
+        # Training Loss
+        fig.add_trace(go.Scatter(y=losses, mode='lines', name='Training Loss'))
+        fig.update_xaxes(title_text='Epoch')
+        # fig.update_yaxes(title_text='Loss')
+        
+        # Validation AUC
+        fig.add_trace(go.Scatter(y=val_auc_scores, mode='lines', name='Validation AUC'))
+        fig.update_xaxes(title_text='Epoch')
+        # fig.update_yaxes(title_text='AUC')
+        
+        fig.update_layout(
+            title_text='Training Progress',
+            height=400, width=800,
+            template='plotly_dark'
+        )
+
+        html_content = f"""
+        <html>
+        <head>
+            <meta http-equiv="refresh" content="2">
+        </head>
+        <body>
+            {fig.to_html(full_html=False, include_plotlyjs='cdn')}
+        </body>
+        </html>
+        """
+        
+        with open(html_file, "w") as f:
+            f.write(html_content)
+        
+    html_file = "training_progress.html"
     for epoch in range(num_epochs):
         epoch_loss = 0
         for input1, input2, label in train_loader:
@@ -143,7 +218,9 @@ def main(args):
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-
+        if epoch == 0:
+            webbrowser.open("file://" + os.path.abspath(html_file))
+    
         losses.append(epoch_loss / len(train_loader))
 
         # Validation loop
@@ -161,6 +238,35 @@ def main(args):
         val_auc = roc_auc_score(val_labels, 1-np.array(val_distances))
         val_auc_scores.append(val_auc)
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {losses[-1]:.4f}, Validation AUC: {val_auc:.4f}")
+
+        update_plot(epoch, loss, val_auc, html_file)
+
+    # Switch to eval mode
+    model.eval()
+
+    def get_embedding(input_sequence):
+        """
+        Generates an embedding for a single input sequence.
+        """
+        with torch.no_grad():  # No gradients needed for inference
+            try:
+                input_sequence = input_sequence.unsqueeze(0) # Add batch dimension
+                embedding = model.forward_once(input_sequence)
+                return embedding.squeeze(0) # Remove batch dimension
+            except Exception as e: # Handle any potential errors
+                print(f"Error getting embedding: {e}")
+                return None
+            
+    # Test with a random signal
+    input_dim = 1 # Example
+    sequence_length = 15 # Example
+    input_sequence = torch.randn(sequence_length, input_dim).float() 
+
+    embedding = get_embedding(input_sequence)
+    print(f"An embedding: {embedding}")
+
+    # Save model
+    save_model(model, np_data.shape[1], feature_names)
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description="Train one-shot")

@@ -123,3 +123,5 @@ __pypackages__/
 dataset/*
 
 tmp/
+src/main/stitch.py
+
